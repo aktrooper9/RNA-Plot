@@ -12,11 +12,36 @@ Notes:
 
 from __future__ import annotations
 import base64, io
+import os
 from pathlib import Path
 from typing import List, Set
 
 import numpy as np
 import pandas as pd
+# --- Auto-load annotations on startup (optional) ---
+DEFAULT_ANNOT_PATH = os.getenv("ANNOT_PATH", "human.GRCh38.p13.csv")
+
+def _load_initial_annotations(path: str):
+    p = Path(path)
+    if not p.exists():
+        return None, ""
+    try:
+        # Detect delimiter
+        with p.open("r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(4096)
+        sep = "\t" if head.count("\t") > head.count(",") else ","
+
+        df_raw = pd.read_csv(p, sep=sep, dtype=str, low_memory=False)
+        df_norm = _normalize_annotation_columns(df_raw)
+        if df_norm.empty:
+            return None, f"Loaded {p.name}, but no recognizable gene_id column."
+        return df_norm.to_dict("records"), f"Loaded annotation for {len(df_norm)} unique gene IDs from {p.name}."
+    except Exception as e:
+        return None, f"Failed to load {p.name}: {e}"
+
+# Preload annotations (if file exists) before building layout
+_INITIAL_ANNOT_DATA, _INITIAL_ANNOT_STATUS = _load_initial_annotations(DEFAULT_ANNOT_PATH)
+
 import dash
 from dash import dcc, html, Output, Input, State
 from dash import dash_table
@@ -157,7 +182,9 @@ app.layout = html.Div(
         html.H2("Volcano + UpSet for DEGs (per-dataset numeric thresholds)"),
 
         # Hidden store to hold optional gene annotations
-        dcc.Store(id="annot-store"),
+        dcc.Store(id="annot-store", data=_INITIAL_ANNOT_DATA),
+        # Store enrichment results (CSV)
+        dcc.Store(id="enrich-store"),
 
         # Thresholds
         html.Div(
@@ -256,7 +283,7 @@ app.layout = html.Div(
                     "gene_symbol ∼ {symbol,gene_symbol}, gene_function ∼ {gene_function,description,gene_name}",
                     style={"color": "#666", "fontSize": "12px", "marginBottom": "8px"}
                 ),
-                html.Div(id="annot-status", style={"fontSize": "12px"}),
+                html.Div(id="annot-status", children=_INITIAL_ANNOT_STATUS or "No annotations loaded yet.", style={"fontSize": "12px"}),
             ], style={"margin": "0 16px 12px"})
         ]),
 
@@ -273,6 +300,80 @@ app.layout = html.Div(
             style_table={"maxHeight": "340px", "overflowY": "auto", "border": "1px solid #eee"},
             style_cell={"fontFamily": "Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif", "fontSize": 12, "padding": "6px"},
         ),
+
+
+        # Enrichment controls (GO/KEGG) for current overlap genes
+        html.H3("Enrichment (on overlap genes)", style={"margin": "16px 16px 6px"}),
+        html.Div([
+
+            html.Div([
+
+                html.Label("Libraries (Enrichr)", style={"display": "block"}),
+
+                dcc.Dropdown(
+
+                    id="enrich-libraries", multi=True, placeholder="Select libraries...",
+
+                    options=[
+
+                        {"label": "KEGG_2021_Human", "value": "KEGG_2021_Human"},
+
+                        {"label": "KEGG_2021_Mouse", "value": "KEGG_2021_Mouse"},
+
+                        {"label": "GO_Biological_Process_2023", "value": "GO_Biological_Process_2023"},
+
+                        {"label": "GO_Molecular_Function_2023", "value": "GO_Molecular_Function_2023"},
+
+                        {"label": "GO_Cellular_Component_2023", "value": "GO_Cellular_Component_2023"}
+
+                    ], value=["KEGG_2021_Human", "GO_Biological_Process_2023"], style={"width": "360px"}
+
+                )
+
+            ], style={"marginRight": "16px"}),
+
+            html.Div([
+
+                html.Label("Species", style={"display": "block"}),
+
+                dcc.Dropdown(id="enrich-species", options=[{"label": "human", "value": "human"}, {"label": "mouse", "value": "mouse"}], value="human", clearable=False, style={"width": "160px"})
+
+            ], style={"marginRight": "16px"}),
+
+            html.Div([
+
+                html.Label("Top N terms", style={"display": "block"}),
+
+                dcc.Input(id="enrich-topn", type="number", min=1, max=100, value=20, style={"width": "120px"})
+
+            ], style={"marginRight": "16px"}),
+
+            html.Button("Run enrichment", id="enrich-run", n_clicks=0),
+
+            html.Button("Download enrichment CSV", id="enrich-dl-btn", n_clicks=0, style={"marginLeft": "12px"}), dcc.Download(id="enrich-dl")
+
+        ], style={"display": "flex", "alignItems": "flex-end", "gap": "8px", "margin": "6px 16px 12px"}),
+
+        html.Div(id="enrich-status", style={"margin": "0 16px 10px", "color": "#555"}),
+
+        dcc.Graph(id="enrich-bar", style={"height": "520px", "margin": "0 16px"}),
+
+        dash_table.DataTable(
+
+            id="enrich-table",
+
+            page_size=10,
+
+            sort_action="native",
+
+            filter_action="native",
+
+            style_table={"maxHeight": "380px", "overflowY": "auto", "border": "1px solid #eee", "margin": "0 16px 16px"},
+
+            style_cell={"fontFamily": "Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif", "fontSize": 12, "padding": "6px"},
+
+        ),
+
 
         html.Hr(),
 
@@ -387,11 +488,14 @@ def update_overlap_table(selected_sets, mode, p0, l0, p1, l1, p2, l2, p3, l3, re
 
     genes = sorted(inter)
     base_df = pd.DataFrame({"gene_id": genes})
+    base_df["gene_id"] = base_df["gene_id"].astype(str).str.split(".").str[0]
 
     # Merge in annotations if provided
     if annot_data:
         try:
             annot_df = pd.DataFrame(annot_data)
+            if "gene_id" in annot_df.columns:
+                annot_df["gene_id"] = annot_df["gene_id"].astype(str).str.split(".").str[0]
             base_df = base_df.merge(annot_df, on="gene_id", how="left")
         except Exception:
             pass
@@ -432,10 +536,13 @@ def download_overlap(n, selected_sets, mode, p0, l0, p1, l1, p2, l2, p3, l3, reg
         inter = inter - others
 
     df = pd.DataFrame({"gene_id": sorted(inter)})
+    df["gene_id"] = df["gene_id"].astype(str).str.split(".").str[0]
     # Merge annotations if present
     if annot_data:
         try:
             annot_df = pd.DataFrame(annot_data)
+            if "gene_id" in annot_df.columns:
+                annot_df["gene_id"] = annot_df["gene_id"].astype(str).str.split(".").str[0]
             df = df.merge(annot_df, on="gene_id", how="left")
         except Exception:
             pass
@@ -467,7 +574,7 @@ def _normalize_annotation_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame()
     if gid is None:
         return out
-    out["gene_id"] = df[gid].astype(str).str.strip()
+    out["gene_id"] = df[gid].astype(str).str.strip().str.split(".").str[0]
     if sym:
         out["gene_symbol"] = df[sym].astype(str).str.strip()
     if fun:
@@ -566,6 +673,108 @@ def download_d(n, padj, lfc, reg):
     s = filter_gene_set(DFS[3], padj, lfc, reg)
     df = pd.DataFrame({"gene_id": sorted(s)})
     return dcc.send_data_frame(df.to_csv, f"{LABELS[3]}_filtered.csv", index=False)
+
+
+# ---- Enrichment (overlap genes -> Enrichr via gseapy) ----
+@app.callback(
+    Output("enrich-table", "data"),
+    Output("enrich-table", "columns"),
+    Output("enrich-bar", "figure"),
+    Output("enrich-status", "children"),
+    Output("enrich-store", "data"),
+    Input("enrich-run", "n_clicks"),
+    State("overlap-sets", "value"),
+    State("overlap-mode", "value"),
+    State("padj-0", "value"), State("lfc-0", "value"),
+    State("padj-1", "value"), State("lfc-1", "value"),
+    State("padj-2", "value"), State("lfc-2", "value"),
+    State("padj-3", "value"), State("lfc-3", "value"),
+    State("regulation", "value"),
+    State("enrich-libraries", "value"),
+    State("enrich-species", "value"),
+    State("enrich-topn", "value"),
+    prevent_initial_call=True,
+)
+def run_enrichment(n_clicks, selected_sets, mode, p0, l0, p1, l1, p2, l2, p3, l3, regulation, libraries, species, topn):
+    import pandas as pd, numpy as np
+    from plotly import graph_objs as go
+    # compute overlap genes (same logic as update_overlap_table)
+    selected = set(int(i) for i in (selected_sets or []))
+    padjs = [sanitize_padj(p0), sanitize_padj(p1), sanitize_padj(p2), sanitize_padj(p3)]
+    lfcs  = [sanitize_lfc(l0),  sanitize_lfc(l1),  sanitize_lfc(l2),  sanitize_lfc(l3)]
+    sets = [filter_gene_set(df, padj, lfc, regulation) for df, padj, lfc in zip(DFS, padjs, lfcs)]
+    if not selected:
+        return [], [], go.Figure(), "Select one or more datasets.", None
+    inter = set.intersection(*(sets[i] for i in selected)) if selected else set()
+    if mode == "exact":
+        others = set.union(*(sets[i] for i in range(4) if i not in selected)) if len(selected) < 4 else set()
+        inter = inter - others
+    genes = sorted(inter)
+    if len(genes) == 0:
+        return [], [], go.Figure(), "No overlapping genes under current thresholds.", None
+    if not libraries:
+        return [], [], go.Figure(), "Choose at least one library.", None
+    # try gseapy dynamically
+    try:
+        import gseapy as gp
+    except Exception as e:
+        return [], [], go.Figure(), f"gseapy not available: {e}", None
+
+    # Run enrichment per library
+    frames = []
+    status_msgs = []
+    for lib in libraries:
+        try:
+            enr = gp.enrichr(gene_list=genes, gene_sets=lib, organism=species, no_plot=True, cutoff=1.0)
+            df = enr.results.copy()
+            df["library"] = lib
+            # standardize columns
+            rename = {"Term":"term","Adjusted P-value":"padj","P-value":"pval","Overlap":"overlap","Odds Ratio":"odds_ratio","Combined Score":"combined_score","Genes":"genes"}
+            for k,v in rename.items():
+                if k in df.columns and v not in df.columns:
+                    df[v] = df[k]
+            keep = [c for c in ["library","term","padj","pval","overlap","odds_ratio","combined_score","genes"] if c in df.columns]
+            df = df[keep].sort_values(["library","padj","pval"], ascending=[True, True, True])
+            frames.append(df)
+            status_msgs.append(f"{lib}: {len(df)} terms")
+        except Exception as e:
+            status_msgs.append(f"{lib}: ERROR {e}")
+    if not frames:
+        return [], [], go.Figure(), "; ".join(status_msgs), None
+    res = pd.concat(frames, ignore_index=True)
+
+    # Build table
+    cols = [{"name": c, "id": c} for c in res.columns]
+    data = res.to_dict("records")
+
+    # Build bar figure: top N per library by -log10(padj)
+    if "padj" in res.columns and "term" in res.columns:
+        res_plot = res.copy()
+        res_plot["neglog10_padj"] = -np.log10(res_plot["padj"].replace(0, np.nextafter(0, 1)))
+        res_plot = res_plot.sort_values(["library","padj"]).groupby("library", as_index=False).head(int(topn or 20))
+        fig = px.bar(res_plot, x="neglog10_padj", y="term", orientation="h", facet_row="library", height=min(1200, 280 + 220*max(1, res_plot['library'].nunique())), labels={"neglog10_padj":"-log10(adj p)","term":"Term"})
+        fig.update_yaxes(matches=None, automargin=True)
+        fig.update_layout(barmode="group", showlegend=False, margin=dict(l=180, r=20, t=40, b=40))
+    else:
+        from plotly import graph_objs as go
+        fig = go.Figure()
+
+    status = f"Enrichment done on {len(genes)} overlap genes. " + " | ".join(status_msgs)
+    # Store CSV for download
+    csv_buf = res.to_csv(index=False)
+    return data, cols, fig, status, csv_buf
+
+# Enrichment CSV download
+@app.callback(
+    Output("enrich-dl", "data"),
+    Input("enrich-dl-btn", "n_clicks"),
+    State("enrich-store", "data"),
+    prevent_initial_call=True,
+)
+def download_enrich(n, csv_buf):
+    if not csv_buf:
+        return dash.no_update
+    return dict(content=csv_buf, filename="enrichment_results.csv", type="text/csv")
 
 if __name__ == "__main__":
     app.run(debug=True)
