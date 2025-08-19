@@ -1,0 +1,7 @@
+dash>=2.17,<3
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8
+plotly>=5.22
+upsetplot>=0.9.0
+gunicorn>=21.2
