@@ -1,4 +1,3 @@
-@ -0,0 +1,571 @@
 #!/usr/bin/env python3
 """
 Updated app per request:
@@ -20,6 +19,7 @@ import numpy as np
 import pandas as pd
 import dash
 from dash import dcc, html, Output, Input, State
+from flask_caching import Cache
 from dash import dash_table
 
 # Headless matplotlib for static images (UpSet)
@@ -98,12 +98,10 @@ def volcano_dataframe(df: pd.DataFrame, padj_thresh: float, lfc_thresh: float) -
     return out
 
 def render_upset_png(named_sets: dict) -> str:
-    """Render an UpSet plot and return a base64 data URI.
-    Bugfix: ensure we save the SAME figure that UpSet draws into by passing
-    fig=... to .plot() (otherwise we may save an empty figure). """
+    """Render an UpSet plot and return a base64 data URI (lighter DPI/size for speed)."""
     total = sum(len(s) for s in named_sets.values())
     if total == 0:
-        fig = plt.figure(figsize=(9, 5.5), dpi=150)
+        fig = plt.figure(figsize=(8.0, 4.8), dpi=110)
         ax = fig.add_subplot(111)
         ax.text(0.5, 0.5, "No genes pass the filters.", ha="center", va="center", fontsize=14)
         ax.axis("off")
@@ -124,10 +122,30 @@ def render_upset_png(named_sets: dict) -> str:
 # Load data once
 DFS = [load_deg_csv(f) for f in FILES]
 
-# -------------- Dash UI --------------
+# Initialize Dash + Cache BEFORE using cache decorators
 app = dash.Dash(__name__)
 app.title = "DEG Volcano + UpSet (4 sets, numeric thresholds)"
 server = app.server  # for WSGI deployments
+cache = Cache(server, config={
+    "CACHE_TYPE": "simple",
+    "CACHE_DEFAULT_TIMEOUT": 3600,
+})
+
+# ---- CACHED HELPERS ---------------------------------------------------------
+@cache.memoize()
+def _filtered_ids(i: int, padj_thresh: float, lfc_thresh: float, regulation: str):
+    """Return a tuple of filtered gene_ids for dataset i (cacheable)."""
+    s = filter_gene_set(DFS[i], padj_thresh, lfc_thresh, regulation)
+    return tuple(sorted(s))
+
+@cache.memoize()
+def _upset_src_cached(thresholds_key: tuple, regulation: str) -> str:
+    """Cache the expensive UpSet image generation."""
+    gene_sets = [set(_filtered_ids(i, p, l, regulation)) for i, (p, l) in enumerate(thresholds_key)]
+    named = {label: s for label, s in zip(LABELS, gene_sets)}
+    return render_upset_png(named)
+
+# -------------- Dash UI --------------
 
 def threshold_block(i: int, label: str) -> html.Div:
     return html.Div(
@@ -138,6 +156,7 @@ def threshold_block(i: int, label: str) -> html.Div:
                 dcc.Input(
                     id=f"padj-{i}", type="number",
                     min=0, max=1, step=0.001, value=DEFAULT_PADJ,
+                    debounce=True,
                     style={"width": "120px"}
                 ),
             ], style={"marginBottom": "8px"}),
@@ -146,6 +165,7 @@ def threshold_block(i: int, label: str) -> html.Div:
                 dcc.Input(
                     id=f"lfc-{i}", type="number",
                     min=0, step=0.01, value=DEFAULT_LFC,
+                    debounce=True,
                     style={"width": "120px"}
                 ),
             ]),
@@ -349,13 +369,14 @@ def update_volcano(idx, p0, l0, p1, l1, p2, l2, p3, l3):
     Input("regulation", "value"),
 )
 def update_upset(p0, l0, p1, l1, p2, l2, p3, l3, regulation):
-    thresholds = [(sanitize_padj(p0), sanitize_lfc(l0)),
-                  (sanitize_padj(p1), sanitize_lfc(l1)),
-                  (sanitize_padj(p2), sanitize_lfc(l2)),
-                  (sanitize_padj(p3), sanitize_lfc(l3))]
-    gene_sets = [filter_gene_set(df, padj, lfc, regulation) for df, (padj, lfc) in zip(DFS, thresholds)]
-    named = {label: s for label, s in zip(LABELS, gene_sets)}
-    return render_upset_png(named)
+    thresholds = [
+        (sanitize_padj(p0), sanitize_lfc(l0)),
+        (sanitize_padj(p1), sanitize_lfc(l1)),
+        (sanitize_padj(p2), sanitize_lfc(l2)),
+        (sanitize_padj(p3), sanitize_lfc(l3)),
+    ]
+    # Use tuple so it's hashable for the cache key
+    return _upset_src_cached(tuple(thresholds), regulation)
 
 # ---- Overlap list (dynamic) ----
 @app.callback(
@@ -569,4 +590,11 @@ def download_d(n, padj, lfc, reg):
     return dcc.send_data_frame(df.to_csv, f"{LABELS[3]}_filtered.csv", index=False)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    import os, webbrowser
+    port = int(os.environ.get("PORT", 8050))
+    # Open browser on startup for convenience
+    try:
+        webbrowser.open(f"http://127.0.0.1:{port}")
+    except Exception:
+        pass
+    app.run(debug=False, host="127.0.0.1", port=port)
