@@ -47,12 +47,15 @@ ANNOT_PATH = os.getenv("ANNOT_PATH", "Human.GRCh38.p13.csv")  # supports .csv/.t
 # Helpers: IO & normalization
 # --------------
 def _read_table(path: Path) -> pd.DataFrame:
-    suf = path.suffix.lower()
-    if suf in (".csv", ".tsv", ".txt", ".gz"):
-        # Let pandas infer delimiter + compression, works for csv/tsv and gz
-        return pd.read_csv(path, sep=None, engine="python", dtype=str, low_memory=False, compression="infer")
-    # Fallback to CSV
-    return pd.read_csv(path, dtype=str, low_memory=False)
+    # Let pandas infer delimiter + compression (csv/tsv + .gz)
+    # IMPORTANT: don't pass low_memory with engine="python"
+    return pd.read_csv(
+        path,
+        sep=None,
+        engine="python",
+        dtype=str,
+        compression="infer"
+    )
 
 def _resolve_path(pth: str) -> Optional[Path]:
     p = Path(pth)
@@ -503,7 +506,13 @@ def handle_annot_upload(contents, filename):
     try:
         content_type, content_string = contents.split(",")
         decoded = base64.b64decode(content_string)
-        df_raw = pd.read_csv(io.BytesIO(decoded), sep=None, engine="python", dtype=str, low_memory=False, compression="infer")
+        df_raw = pd.read_csv(
+            io.BytesIO(decoded),
+            sep=None,
+            engine="python",
+            dtype=str,
+            compression="infer"
+        )
         df_norm = _normalize_annotation_columns(df_raw)
         if df_norm.empty:
             return dash.no_update, "Uploaded file did not contain a recognizable gene ID column."
