@@ -19,7 +19,7 @@ from typing import List, Set
 import numpy as np
 import pandas as pd
 # --- Auto-load annotations on startup (optional) ---
-DEFAULT_ANNOT_PATH = os.getenv("ANNOT_PATH", "human.GRCh38.p13.csv")
+DEFAULT_ANNOT_PATH = os.getenv("ANNOT_PATH", "Human.GRCh38.p13.csv")
 
 def _load_initial_annotations(path: str):
     p = Path(path)
