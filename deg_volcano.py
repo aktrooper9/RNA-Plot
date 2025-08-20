@@ -19,18 +19,58 @@ from typing import List, Set
 import numpy as np
 import pandas as pd
 # --- Auto-load annotations on startup (optional) ---
-DEFAULT_ANNOT_PATH = os.getenv("ANNOT_PATH", "Human.GRCh38.p13.csv")
+DEFAULT_ANNOT_PATH = os.getenv("ANNOT_PATH", Human.GRCh38.p13.csv")
+
+def _normalize_annotation_columns(df):
+    """
+    Normalize arbitrary human annotation columns to:
+      - gene_id
+      - gene_symbol  (if present)
+      - gene_function (aka 'gene_name' or 'description' if present)
+    Also strip Ensembl version suffix from gene_id if needed.
+    """
+    cols = {c.lower().strip(): c for c in df.columns}
+    # gene_id candidates
+    gid = None
+    for c in ["gene_id", "ensembl_gene_id", "ensembl", "id", "gene"]:
+        if c in cols:
+            gid = cols[c]; break
+    if gid is None:
+        # sometimes the first column IS the ID, fallback:
+        gid = df.columns[0]
+
+    # symbol candidates
+    sym = None
+    for c in ["symbol", "hgnc_symbol", "gene_symbol", "genesymbol"]:
+        if c in cols:
+            sym = cols[c]; break
+
+    # function/name/description candidates
+    fun = None
+    for c in ["gene_function", "gene_name", "name", "description", "gene_description"]:
+        if c in cols:
+            fun = cols[c]; break
+
+    out = df[[gid]].copy().rename(columns={gid: "gene_id"})
+    # strip version if present
+    out["gene_id"] = out["gene_id"].astype(str).str.strip().str.split(".").str[0]
+    if sym:
+        out["gene_symbol"] = df[sym].astype(str).str.strip()
+    if fun:
+        out["gene_function"] = df[fun].astype(str).str.strip()
+    return out.drop_duplicates(subset=["gene_id"])
 
 def _load_initial_annotations(path: str):
     p = Path(path)
     if not p.exists():
-        return None, ""
+        return None, f"No annotation file found at {p.resolve()} (set ANNOT_PATH or upload in the UI)."
     try:
-        # Detect delimiter
+        # Try CSV, fallback TSV if it looks tabbed
         with p.open("r", encoding="utf-8", errors="ignore") as fh:
             head = fh.read(4096)
         sep = "\t" if head.count("\t") > head.count(",") else ","
 
+        import pandas as pd
         df_raw = pd.read_csv(p, sep=sep, dtype=str, low_memory=False)
         df_norm = _normalize_annotation_columns(df_raw)
         if df_norm.empty:
@@ -38,7 +78,7 @@ def _load_initial_annotations(path: str):
         return df_norm.to_dict("records"), f"Loaded annotation for {len(df_norm)} unique gene IDs from {p.name}."
     except Exception as e:
         return None, f"Failed to load {p.name}: {e}"
-
+        
 # Preload annotations (if file exists) before building layout
 _INITIAL_ANNOT_DATA, _INITIAL_ANNOT_STATUS = _load_initial_annotations(DEFAULT_ANNOT_PATH)
 
@@ -183,8 +223,10 @@ app.layout = html.Div(
 
         # Hidden store to hold optional gene annotations
         dcc.Store(id="annot-store", data=_INITIAL_ANNOT_DATA),
-        # Store enrichment results (CSV)
-        dcc.Store(id="enrich-store"),
+
+        # Status text for annotations (show what was auto-loaded)
+        html.Div(id="annot-status", children=_INITIAL_ANNOT_STATUS or "No annotations loaded yet.",
+         style={"margin": "0 16px 10px", "color": "#555"}),
 
         # Thresholds
         html.Div(
@@ -493,14 +535,17 @@ def update_overlap_table(selected_sets, mode, p0, l0, p1, l1, p2, l2, p3, l3, re
     # Merge in annotations if provided
     if annot_data:
         try:
-            annot_df = pd.DataFrame(annot_data)
-            if "gene_id" in annot_df.columns:
-                annot_df["gene_id"] = annot_df["gene_id"].astype(str).str.split(".").str[0]
-            base_df = base_df.merge(annot_df, on="gene_id", how="left")
-        except Exception:
-            pass
-
+            df_annot = pd.DataFrame(annot_data)
+            df_annot["gene_id"] = df_annot["gene_id"].astype(str).str.split(".").str[0]
+            out = base_df.merge(df_annot, on="gene_id", how="left")
+            # ensure consistent visible columns
+            want_cols = ["gene_id", "gene_symbol", "gene_function"]
+            out = out[[c for c in want_cols if c in out.columns]]
+            return out.to_dict("records"), f"{len(out)} genes (annotations merged)."
+        except Exception as e:
+            return base_df.to_dict("records"), f"{len(base_df)} genes (annotation merge failed: {e})"
     for col in ["gene_symbol", "gene_function"]:
+    
         if col not in base_df.columns:
             base_df[col] = ""
 
