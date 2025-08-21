@@ -27,6 +27,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from upsetplot import UpSet, from_contents
+import re
 
 import dash
 from dash import Dash, dcc, html, dash_table, Input, Output, State
@@ -37,7 +38,7 @@ import plotly.express as px
 FILES  = ["29081.csv", "115828.csv", "135092.csv", "99248.csv"]
 LABELS = [Path(f).stem for f in FILES]
 DEFAULT_PADJ = 0.05
-DEFAULT_LFC  = 1.0
+DEFAULT_LFC  = 0.58
 # ---------------------------
 
 def load_deg_csv(path: str | Path) -> pd.DataFrame:
@@ -201,6 +202,57 @@ def normalize_annotation_df(df: pd.DataFrame) -> pd.DataFrame:
         if k in out.columns:
             out[k] = out[k].astype(str).str.strip()
     return out
+
+def _norm_id(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip()
+    return re.sub(r"\.0+$", "", s)
+
+def merge_overlap_with_annotation(base_df: pd.DataFrame, annot_df: pd.DataFrame) -> pd.DataFrame:
+    # Normalize / canonicalize headers & coerce IDs to comparable strings
+    annot_df = normalize_annotation_df(annot_df).copy()
+
+    base = base_df.copy()
+    base["gene_id"] = base["gene_id"].map(_norm_id)
+
+    if "gene_id" in annot_df.columns:
+        annot_df["gene_id"] = annot_df["gene_id"].map(_norm_id)
+    if "ensembl_id" in annot_df.columns:
+        annot_df["ensembl_id"] = annot_df["ensembl_id"].map(_norm_id)
+
+    # Decide join key: Ensembl if most IDs look like ENSG*, else Entrez-style gene_id
+    ids = base["gene_id"].dropna().astype(str)
+    use_ensembl = (ids.str.upper().str.startswith("ENSG")).mean() > 0.6
+
+    if use_ensembl and "ensembl_id" in annot_df.columns:
+        merged = base.merge(
+            annot_df.drop_duplicates("ensembl_id"),
+            left_on="gene_id",
+            right_on="ensembl_id",
+            how="left",
+        )
+    else:
+        merged = base.merge(
+            annot_df.drop_duplicates("gene_id"),
+            on="gene_id",
+            how="left",
+        )
+
+    # Ensure display columns exist
+    if "gene_symbol" not in merged.columns:
+        merged["gene_symbol"] = pd.NA
+    if "gene_function" not in merged.columns:
+        merged["gene_function"] = pd.NA
+
+    # Stable column order
+    preferred = [c for c in [
+        "gene_id", "gene_symbol", "gene_function", "description", "synonyms",
+        "gene_type", "ensembl_id", "status", "chr_acc", "chr_start", "chr_stop",
+        "strand", "length", "go_mf", "go_bp", "go_cc", "go_mf_id", "go_bp_id", "go_cc_id"
+    ] if c in merged.columns]
+    other = [c for c in merged.columns if c not in preferred]
+    return merged[preferred + other]
 
 def parse_annot_upload(contents: str, filename: str) -> pd.DataFrame:
     """Parse uploaded annotation content as CSV/TSV (delimiter auto-detected)."""
@@ -405,19 +457,25 @@ def update_upset(p0, l0, p1, l1, p2, l2, p3, l3, regulation):
     State("annot-store", "data"),
 )
 def update_overlap(selected, mode, p0, l0, p1, l1, p2, l2, p3, l3, regulation, annot_data):
-    selected = selected or []
-    if not selected:
-        return [], "0"
+    # Build the overlap set 'base_df' (unchanged)
+    sets = []
+    for idx, (p, l) in enumerate([(p0, l0), (p1, l1), (p2, l2), (p3, l3)]):
+        try:
+            df = pd.read_csv(f"deg_{idx}.csv", dtype={0: str}, low_memory=False)
+        except Exception:
+            df = pd.read_csv(f"deg_{idx}.csv", header=None, usecols=[0, 1, 2], low_memory=False)
+            df.columns = ["gene_id", "padj", "log2fc"]
+        df["gene_id"] = df["gene_id"].astype(str).str.strip()
+        if regulation == "up":
+            df = df[(df["padj"] <= p) & (df["log2fc"] >= l)]
+        elif regulation == "down":
+            df = df[(df["padj"] <= p) & (df["log2fc"] <= -abs(l))]
+        else:
+            df = df[(df["padj"] <= p) & (df["log2fc"].abs() >= abs(l))]
+        sets.append(set(df["gene_id"]))
 
-    thresholds = [(sanitize_padj(p0), sanitize_lfc(l0)),
-                  (sanitize_padj(p1), sanitize_lfc(l1)),
-                  (sanitize_padj(p2), sanitize_lfc(l2)),
-                  (sanitize_padj(p3), sanitize_lfc(l3))]
-    sets = [filter_gene_set(df, padj, lfc, regulation) for df, (padj, lfc) in zip(DFS, thresholds)]
-
-    inter = set.intersection(*(sets[i] for i in selected))
-    if mode == "exact" and len(selected) < len(sets):
-        # Remove any genes that appear in unselected sets
+    inter = set.intersection(*(sets[i] for i in selected)) if selected else set()
+    if mode == "exclusive" and selected:
         others = set.union(*(sets[i] for i in range(len(sets)) if i not in selected))
         inter = inter - others
 
@@ -426,34 +484,12 @@ def update_overlap(selected, mode, p0, l0, p1, l1, p2, l2, p3, l3, regulation, a
     base_df["gene_id"] = base_df["gene_id"].astype(str).str.strip()
     base_df = base_df.drop_duplicates(subset=["gene_id"])
 
-    # Merge annotations if present
+    # ---- Fixed: robust annotation merge (just two lines) ----
     if annot_data:
         try:
             annot_df = pd.DataFrame(annot_data)
-            annot_df = normalize_annotation_df(annot_df)  # ensure normalized
-
-            # Heuristic for Ensembl-style IDs
-            base_ids = base_df["gene_id"].dropna().astype(str)
-            ensg_ratio = (base_ids.str.upper().str.startswith("ENSG")).mean() if len(base_ids) else 0.0
-
-            if ensg_ratio > 0.6 and "ensembl_id" in annot_df.columns:
-                annot_df["_join_key"] = annot_df["ensembl_id"]
-            else:
-                annot_df["_join_key"] = annot_df["gene_id"]
-
-            joined = base_df.merge(
-                annot_df.drop_duplicates("_join_key"),
-                left_on="gene_id", right_on="_join_key", how="left"
-            ).drop(columns=["_join_key"])
-
-            # Nice column order
-            preferred = [c for c in [
-                "gene_id", "gene_symbol", "gene_function", "description", "synonyms",
-                "gene_type", "ensembl_id", "status", "chr_acc", "chr_start", "chr_stop",
-                "strand", "length", "go_mf", "go_bp", "go_cc", "go_mf_id", "go_bp_id", "go_cc_id"
-            ] if c in joined.columns]
-            other = [c for c in joined.columns if c not in preferred]
-            base_df = joined[preferred + other]
+            # Replace the whole old heuristic block with this single call:
+            base_df = merge_overlap_with_annotation(base_df, annot_df)
         except Exception as e:
             print("Annotation merge failed:", e)
 
@@ -482,7 +518,7 @@ def upload_annot(contents, filename):
     if not contents:
         return dash.no_update, "No file."
     try:
-        df = parse_annot_upload(contents, filename or "annotation")
+        df = parse_annot_upload(contents, filename or "annotation")  # already fine — keep this
         return df.to_dict("records"), f"Loaded {len(df)} annotation rows."
     except Exception as e:
         return dash.no_update, f"Failed to parse annotation: {e}"
