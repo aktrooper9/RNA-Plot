@@ -9,7 +9,7 @@ DEG Volcano + UpSet (patched)
   Auto-normalized and merged into overlap list / download.
 
 Requirements:
-  pip install dash pandas numpy plotly matplotlib upsetplot
+  pip install pandas numpy plotly matplotlib upsetplot
 
 Files expected in working dir:
   29081.csv  115828.csv  135092.csv  99248.csv
@@ -215,6 +215,7 @@ DFS = [load_deg_csv(f) for f in FILES]
 # -------------- Dash UI --------------
 app = Dash(__name__)
 app.title = "DEG Volcano + UpSet (patched)"
+server = app.server  # for WSGI deployments
 
 def threshold_block(i: int, label: str) -> html.Div:
     return html.Div(
