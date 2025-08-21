@@ -278,79 +278,9 @@ app.layout = html.Div(
 
 
         # Enrichment controls (GO/KEGG) for current overlap genes
-        html.H3("Enrichment (on overlap genes)", style={"margin": "16px 16px 6px"}),
-        html.Div([
-
-            html.Div([
-
-                html.Label("Libraries (Enrichr)", style={"display": "block"}),
-
-                dcc.Dropdown(
-
-                    id="enrich-libraries", multi=True, placeholder="Select libraries...",
-
-                    options=[
-
-                        {"label": "KEGG_2021_Human", "value": "KEGG_2021_Human"},
-
-                        {"label": "KEGG_2021_Mouse", "value": "KEGG_2021_Mouse"},
-
-                        {"label": "GO_Biological_Process_2023", "value": "GO_Biological_Process_2023"},
-
-                        {"label": "GO_Molecular_Function_2023", "value": "GO_Molecular_Function_2023"},
-
-                        {"label": "GO_Cellular_Component_2023", "value": "GO_Cellular_Component_2023"}
-
-                    ], value=["KEGG_2021_Human", "GO_Biological_Process_2023"], style={"width": "360px"}
-
-                )
-
-            ], style={"marginRight": "16px"}),
-
-            html.Div([
-
-                html.Label("Species", style={"display": "block"}),
-
-                dcc.Dropdown(id="enrich-species", options=[{"label": "human", "value": "human"}, {"label": "mouse", "value": "mouse"}], value="human", clearable=False, style={"width": "160px"})
-
-            ], style={"marginRight": "16px"}),
-
-            html.Div([
-
-                html.Label("Top N terms", style={"display": "block"}),
-
-                dcc.Input(id="enrich-topn", type="number", min=1, max=100, value=20, style={"width": "120px"})
-
-            ], style={"marginRight": "16px"}),
-
-            html.Button("Run enrichment", id="enrich-run", n_clicks=0),
-
-            html.Button("Download enrichment CSV", id="enrich-dl-btn", n_clicks=0, style={"marginLeft": "12px"}), dcc.Download(id="enrich-dl")
-
-        ], style={"display": "flex", "alignItems": "flex-end", "gap": "8px", "margin": "6px 16px 12px"}),
-
-        html.Div(id="enrich-status", style={"margin": "0 16px 10px", "color": "#555"}),
-
-        dcc.Graph(id="enrich-bar", style={"height": "520px", "margin": "0 16px"}),
-
-        dash_table.DataTable(
-
-            id="enrich-table",
-
-            page_size=10,
-
-            sort_action="native",
-
-            filter_action="native",
-
-            style_table={"maxHeight": "380px", "overflowY": "auto", "border": "1px solid #eee", "margin": "0 16px 16px"},
-
-            style_cell={"fontFamily": "Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif", "fontSize": 12, "padding": "6px"},
-
-        ),
-
-
-        html.Hr(),
+        html.H3("Enrichment disabled", style={"margin": "16px 16px 6px", "color": "#666"}),
+        html.Div("This build has enrichment commented out per request.", style={"margin": "0 16px 12px", "color": "#666"}),
+html.Hr(),
 
         # Four per-dataset downloads (unchanged)
         html.Div(
@@ -462,7 +392,7 @@ def update_overlap_table(selected_sets, mode, p0, l0, p1, l1, p2, l2, p3, l3, re
         inter = inter - others
 
     genes = sorted(inter)
-    base_df = pd.DataFrame({"gene_id": genes})
+    base_df = pd.DataFrame({"gene_id": [str(g) for g in genes]})
 
     # Merge in annotations if provided
     if annot_data:
@@ -507,7 +437,7 @@ def download_overlap(n, selected_sets, mode, p0, l0, p1, l1, p2, l2, p3, l3, reg
         others = set.union(*(sets[i] for i in range(4) if i not in selected)) if len(selected) < 4 else set()
         inter = inter - others
 
-    df = pd.DataFrame({"gene_id": sorted(inter)})
+    df = pd.DataFrame({"gene_id": [str(g) for g in sorted(inter)]})
     # Merge annotations if present
     if annot_data:
         try:
@@ -523,10 +453,15 @@ def download_overlap(n, selected_sets, mode, p0, l0, p1, l1, p2, l2, p3, l3, reg
 
 # ---- Annotation upload handling ----
 
+
+def _strip_ver(x):
+    if isinstance(x, str) and x.upper().startswith(('ENSG','ENST','ENSMUSG','ENSMUST')) and '.' in x:
+        return x.split('.',1)[0]
+    return x
 def _normalize_annotation_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Return df with columns: gene_id, gene_symbol, gene_function (where available)."""
     lower = {c.lower(): c for c in df.columns}
-    gid_opts = ["gene_id", "gene", "geneid", "id", "symbol"]
+    gid_opts = ["ensemblgeneid", "ensembl_gene_id", "gene_id", "gene", "geneid", "id", "symbol"]
     sym_opts = ["gene_symbol", "symbol", "hgnc_symbol"]
     fun_opts = ["gene_function", "function", "description", "gene_name", "name", "product"]
 
@@ -566,7 +501,7 @@ def handle_annot_upload(contents, filename):
         decoded = base64.b64decode(content_string)
         text = decoded.decode('utf-8', errors='ignore')
         from io import StringIO
-        sep = '    ' if (filename and filename.lower().endswith('.tsv')) or (text.count('    ') > text.count(',')) else ','
+        sep = '\t' if (filename and filename.lower().endswith('.tsv')) or (text.count('    ') > text.count(',')) else ','
         df_raw = pd.read_csv(StringIO(text), sep=sep)
         df_norm = _normalize_annotation_columns(df_raw)
         if df_norm.empty:
@@ -645,6 +580,7 @@ def download_d(n, padj, lfc, reg):
 
 
 # ---- Enrichment (overlap genes -> Enrichr via gseapy) ----
+"""
 @app.callback(
     Output("enrich-table", "data"),
     Output("enrich-table", "columns"),
@@ -734,6 +670,9 @@ def run_enrichment(n_clicks, selected_sets, mode, p0, l0, p1, l1, p2, l2, p3, l3
     return data, cols, fig, status, csv_buf
 
 # Enrichment CSV download
+
+"""
+"""
 @app.callback(
     Output("enrich-dl", "data"),
     Input("enrich-dl-btn", "n_clicks"),
@@ -747,3 +686,5 @@ def download_enrich(n, csv_buf):
 
 if __name__ == "__main__":
     app.run(debug=True)
+
+"""
